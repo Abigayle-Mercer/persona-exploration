@@ -410,6 +410,6 @@ class GrammarEditor(BasePersona):
             id=stream_msg_id,
             body="Can you take a look at this notebook?",
             time=time(),
-            sender=self.id,
-            mentions=["@Jupyternaut"]
+            sender=message.sender,
+            mentions=["@GrammarEditor"]
         ))
