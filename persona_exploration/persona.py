@@ -386,6 +386,48 @@ class GrammarEditor(BasePersona):
                 append=False,  # we're replacing, not appending individual lines
             )
 
+    def add_fake_cursor_to_existing_client(self, notebook: YNotebook, target_client_id: int):
+        self.log.info("SOMETHING IS HAPPENING HEREEEEEEEEE")
+        awareness = notebook.awareness
+        state = awareness.states.get(target_client_id)
+
+        if not state:
+            self.log.warning(f"Client ID {target_client_id} not found in awareness.states.")
+            return
+
+        new_cursor = {
+            "anchor": {
+                "type": {"client": 1973309547, "clock": 122},
+                "tname": None,
+                "item": {"client": 1973309547, "clock": 148},
+                "assoc": 0
+            },
+            "head": {
+                "type": {"client": 1973309547, "clock": 122},
+                "tname": None,
+                "item": {"client": 1973309547, "clock": 148},
+                "assoc": 0
+            },
+            "primary": False,  # mark this one non-primary just in case
+            "empty": True
+        }
+
+        # Modify the state's cursor list
+        if "cursors" not in state:
+            state["cursors"] = []
+
+        state["cursors"].append(new_cursor)
+
+        self.log.info(f"🧪 Added fake cursor to client {target_client_id}: {json.dumps(new_cursor, indent=2)}")
+
+    # This won't trigger a UI update, but you can log or inspect behavior server-side
+
+    def find_client_id_by_username(self, notebook: YNotebook, username: str) -> Optional[int]:
+        for client_id, state in notebook.awareness.states.items():
+            user = state.get("user", {})
+            if user.get("username") == username:
+                return client_id
+        return None
 
     async def process_message(self, message: Message):
         
@@ -400,16 +442,22 @@ class GrammarEditor(BasePersona):
                 )
             )
             return
-    
+        client_id = self.find_client_id_by_username(notebook, message.sender)
+        if client_id is None:
+            self.log.warning(f"❌ No awareness client found for sender: {message.sender}")
+            return
 
+        self.add_fake_cursor_to_existing_client(notebook, client_id)
+            
 
+        """
         self.log.info(f"MESSAGE BODY: {message.body}")
         if message.body == "@GrammarEditor Can you start a collaborative session?": 
             self._startCollab = True
             await self.stream_typing("Starting collaborative session now. Looking for grammar mistakes...")
             self.start_collaborative_session(notebook)
 
-
+        """
 
 
                 
