@@ -23,6 +23,7 @@ from typing import Optional, Tuple
 from jupyter_ydoc.ynotebook import YNotebook
 from pycrdt import Text  # or y_py.YText depending on backend
 from collections import defaultdict
+import uuid
 
 
 
@@ -63,7 +64,7 @@ cell 3: Removed ""
 TODO: 
 - Some kind of cursor update for the persona when it's writing
 - be able to tell the active notebook when multiple notebooks are open
-- 
+- Be able to have personas call others
 """
 
 
@@ -389,27 +390,26 @@ class GrammarEditor(BasePersona):
 
     async def process_message(self, message: Message):
         
-        notebook = await self.get_active_notebook(message.sender)
-        if not notebook:
-            self.ychat.add_message(
-                NewMessage(
-           
-                    body="❌ Could not find your active notebook!",
-                    sender=self.id,
-               
-                )
-            )
-            return
-    
+        stream_msg_id = self.ychat.add_message(NewMessage(
+            body="",
+            sender=self.id
+        ))
 
-
-        self.log.info(f"MESSAGE BODY: {message.body}")
-        if message.body == "@GrammarEditor Can you start a collaborative session?": 
-            self._startCollab = True
+        if message.body == "@GrammarEditor Can you take a look at this notebook?":
+            self.log.info("Retriggered agent!")
             await self.stream_typing("Starting collaborative session now. Looking for grammar mistakes...")
-            self.start_collaborative_session(notebook)
+
+        if message.body == "Can you take a look at this notebook?":
+            self.log.info("Retriggered agent!")
+            await self.stream_typing("Starting collaborative session now. Looking for grammar mistakes...")
+          
 
 
-
-
-                
+        # Step 2: Update it with full data (including mentions)
+        self.ychat.update_message(Message(
+            id=stream_msg_id,
+            body="Can you take a look at this notebook?",
+            time=time(),
+            sender=self.id,
+            mentions=["@Jupyternaut"]
+        ))
