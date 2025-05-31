@@ -63,7 +63,7 @@ cell 3: Removed ""
 TODO: 
 - Some kind of cursor update for the persona when it's writing
 - be able to tell the active notebook when multiple notebooks are open
-- 
+- Can personas call out to eachother 
 """
 
 
