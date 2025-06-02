@@ -1,7 +1,3 @@
-
-
-
-
 import asyncio
 from jupyter_ai.personas.base_persona import BasePersona, PersonaDefaults
 from jupyterlab_chat.models import Message
@@ -63,7 +59,28 @@ cell 3: Removed ""
 TODO: 
 - Some kind of cursor update for the persona when it's writing
 - be able to tell the active notebook when multiple notebooks are open
+     the_room_id = "JupyterLab:globalAwareness" 
+
+        doc = websocket_server.rooms[the_room_id]
+        self.log.info(f"JUPYTER LAB GLOBAL: {doc.awareness.states}")
 - Can personas call out to eachother 
+
+DEMO: 
+- 3 peronsas 
+    1. prompt to go through copy edit your markdown cells 
+        - have some tone variables
+        - grammar & tone
+
+    2. Linting agent
+    3. Unit Test --> open a python file and start writing  
+    4. add comments
+
+    one persona that you temperarory have in place that turns on the functionality of the 3 
+    or call out individually
+    THE GOAL: a single supervisor that is able to call out the other personas 
+
+    be reusable --> no vaporware
+
 """
 
 
@@ -430,8 +447,60 @@ class GrammarEditor(BasePersona):
         return None
 
     async def process_message(self, message: Message):
+
+        handler = CallContext.get(CallContext.JUPYTER_HANDLER)
+        serverapp = handler.serverapp
+        collaboration = serverapp.web_app.settings["jupyter_server_ydoc"]
+        websocket_server = collaboration.ywebsocket_server
+        client_id = message.sender
+    
+        the_room_id = "JupyterLab:globalAwareness" 
+
+        doc = websocket_server.rooms[the_room_id]
+        self.log.info(f"JUPYTER LAB GLOBAL: {doc.awareness.states}")
+            
+        # 
+        for room_id in websocket_server.rooms.keys():
+            try:
+                doc = await collaboration.get_document(
+                    room_id=room_id,
+                    copy=False
+                )
+                notebook_name = getattr(doc, "path", "<unknown>")
+                # look to find path match here
+                self.log.info(f"📄 Document for room {room_id} is of type: {type(doc)}")
+            except Exception as e:
+                self.log.warning(f"Could not get document for room {room_id}: {e}")
+                continue
+
+            if not isinstance(doc, YNotebook):
+                continue
+
+            try:
+                awareness_states = doc.awareness.states
+            except AttributeError:
+                self.log.warning(f"Document {room_id} has no awareness.")
+                continue
+            
+            self.log.info(f"ALL STATES: {awareness_states.items()}")
+            for clientID, state in awareness_states.items():
+                user = state.get("user", {})
+                cursors = state.get("cursors", [])
+                
+                username = user.get("username")
+
+                self.log.info(f"👤 clientID={clientID}, username={username}, cursors={bool(cursors)}")
+
+                if username == client_id and cursors:
+                    self.log.info(f"CURSORS: {cursors[0]}")
+                    notebook_name = getattr(doc, "path", "<unknown>")
+                    self.log.info(f"✅ Found notebook '{notebook_name}' for client_id: {client_id} in room {room_id}")
+                    self.log.info(f"📡 Full awareness state for client {clientID}: {json.dumps(state, indent=2)}")
+                    
+                    
+
         
-        notebook = await self.get_active_notebook(message.sender)
+        """notebook = await self.get_active_notebook(message.sender)
         if not notebook:
             self.ychat.add_message(
                 NewMessage(
@@ -448,7 +517,7 @@ class GrammarEditor(BasePersona):
             return
 
         self.add_fake_cursor_to_existing_client(notebook, client_id)
-            
+        """
 
         """
         self.log.info(f"MESSAGE BODY: {message.body}")
