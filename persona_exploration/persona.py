@@ -59,12 +59,37 @@ cell 3: Removed ""
 
 """
 
+
 """
 TODO: 
 - Some kind of cursor update for the persona when it's writing
 - be able to tell the active notebook when multiple notebooks are open
-- 
+     the_room_id = "JupyterLab:globalAwareness" 
+
+        doc = websocket_server.rooms[the_room_id]
+        self.log.info(f"JUPYTER LAB GLOBAL: {doc.awareness.states}")
+- Can personas call out to eachother 
+
+DEMO: 
+- 3 peronsas 
+    1. prompt to go through copy edit your markdown cells 
+        - have some tone variables
+        - grammar & tone
+
+    2. Linting agent
+    3. Unit Test --> open a python file and start writing  
+    4. add comments
+
+    one persona that you temperarory have in place that turns on the functionality of the 3 
+    or call out individually
+    THE GOAL: a single supervisor that is able to call out the other personas 
+
+    be reusable --> no vaporware
+
 """
+
+
+
 
 
 class State(TypedDict):
@@ -96,6 +121,7 @@ class GrammarEditor(BasePersona):
         self._last_cell = ""
         self._startCollab = False
         self._user_prompt = ""
+        self.notebooks = {}
 
     @property
     def defaults(self):
@@ -105,54 +131,55 @@ class GrammarEditor(BasePersona):
             avatar_path="/api/ai/static/jupyternaut.svg",
             system_prompt="You are a function-calling assistant operating inside a JupyterLab environment, use your tools to operate on the notebook!"
         )
+    
 
-    async def get_active_notebook(self, client_id: str) -> YNotebook | None:
+    async def get_active_cell(self, notebook): 
+        awareness_states = notebook.awareness.states
+        self.log.info(f"ALL STATES: {awareness_states.items()}")
+        for client_id, state in awareness_states.items():
+            active_cell = state.get("activeCellId")
+            self.log.info(f"👤 Client {client_id} activeCellId: {active_cell}")
+            if active_cell: 
+                return active_cell
 
+        return "NO CELL ID"
+    
+
+    def extract_current_notebook_path(self, global_awareness_doc, target_username: str) -> str | None:
+            for client_id, state in global_awareness_doc.awareness.states.items():
+                user = state.get("user", {})
+                username = user.get("username")
+                if username == target_username:
+                    current = state.get("current")
+                    if current and current.startswith("notebook:"):
+                        return current.removeprefix("notebook:RTC:")  # Python 3.9+
+            return None
+        
+    async def get_active_notebook(self, client_id: str, notebook_path: str) -> YNotebook | None:
         handler = CallContext.get(CallContext.JUPYTER_HANDLER)
         serverapp = handler.serverapp
         collaboration = serverapp.web_app.settings["jupyter_server_ydoc"]
         websocket_server = collaboration.ywebsocket_server
 
-        # print aout all the room's doc's awarenesses all at once
-        for room_id in websocket_server.rooms.keys():
+        for room_id in websocket_server.rooms:
             try:
-                doc = await collaboration.get_document(
-                    room_id=room_id,
-                    copy=False
-                )
-                notebook_name = getattr(doc, "path", "<unknown>")
-                # look to find path match here
-                self.log.info(f"📄 Document for room {room_id} is of type: {type(doc)}")
-            except Exception as e:
-                self.log.warning(f"Could not get document for room {room_id}: {e}")
-                continue
-
-            if not isinstance(doc, YNotebook):
-                continue
-
-            try:
-                awareness_states = doc.awareness.states
-            except AttributeError:
-                self.log.warning(f"Document {room_id} has no awareness.")
-                continue
-            
-            self.log.info(f"ALL STATES: {awareness_states.items()}")
-            for clientID, state in awareness_states.items():
-                user = state.get("user", {})
-                cursors = state.get("cursors", [])
-                
-                username = user.get("username")
-
-                self.log.info(f"👤 clientID={clientID}, username={username}, cursors={bool(cursors)}")
-
-                if username == client_id and cursors:
-                    self.log.info(f"CURSORS: {cursors[0]}")
-                    notebook_name = getattr(doc, "path", "<unknown>")
-                    self.log.info(f"✅ Found notebook '{notebook_name}' for client_id: {client_id} in room {room_id}")
-                    self.log.info(f"📡 Full awareness state for client {clientID}: {json.dumps(state, indent=2)}")
+                doc = await collaboration.get_document(room_id=room_id, copy=False)
+                path = getattr(doc, "path", None)
+                self.log.info(f"Path: {path}")
+                if isinstance(doc, YNotebook) and getattr(doc, "path", None) == notebook_path:
+                    self.log.info(f"✅ Matched path '{notebook_path}' in room {room_id}")
+                    awareness_states = doc.awareness.states
+                    self.log.info(f"ALL STATES: {awareness_states.items()}")
+                   
+                    for client_id, state in awareness_states.items():
+                        active_cell = state.get("activeCellId")
+                        self.log.info(f"👤 Client {client_id} activeCellId: {active_cell}")
+             
                     return doc
-                    
+            except Exception as e:
+                self.log.warning(f"⚠️ Could not inspect room {room_id}: {e}")
 
+      
         self.log.warning(f"❌ No active notebook found for client_id: {client_id}")
         return None
 
@@ -368,6 +395,36 @@ class GrammarEditor(BasePersona):
         self.log.info("✅ Awareness observer registered.")
 
 
+    async def start_global_observation(self, client_id):
+        """
+        Observes awareness changes in global awarness
+        """
+        handler = CallContext.get(CallContext.JUPYTER_HANDLER)
+        serverapp = handler.serverapp
+        collaboration = serverapp.web_app.settings["jupyter_server_ydoc"]
+        websocket_server = collaboration.ywebsocket_server
+
+        the_room_id = "JupyterLab:globalAwareness" 
+
+        doc = websocket_server.rooms[the_room_id]
+
+        async def on_awareness_change(event_type, data):
+            doc = websocket_server.rooms[the_room_id]
+            self.log.info(f"JUPYTER LAB GLOBAL: {doc.awareness.states}")
+            self.log.info(f"CLIENT ID: {client_id}")
+
+            global_doc = websocket_server.rooms[the_room_id]
+            active_notebook_path = self.extract_current_notebook_path(global_doc, client_id)
+            notebook = self.get_active_notebook(client_id, active_notebook_path)
+            self.start_collaborative_session(notebook)
+                
+    
+        awareness = doc.awareness
+        awareness.observe(on_awareness_change)
+        self.log.info("✅ GLOBAL Awareness observer registered.")
+
+
+
     async def stream_typing(self, full_text: str):
         stream_msg_id = self.ychat.add_message(NewMessage(body="", sender=self.id))
         current_text = ""
@@ -387,20 +444,17 @@ class GrammarEditor(BasePersona):
             )
 
 
+
     async def process_message(self, message: Message):
-        
-        notebook = await self.get_active_notebook(message.sender)
-        if not notebook:
-            self.ychat.add_message(
-                NewMessage(
-           
-                    body="❌ Could not find your active notebook!",
-                    sender=self.id,
-               
-                )
-            )
-            return
-    
+
+        client_id = message.sender
+
+
+        async def start_collaborative_session(): 
+            await self.start_global_observation(client_id)
+
+        # make a simple agent with one tool
+        # that tool is starting a collaborative session
 
 
         self.log.info(f"MESSAGE BODY: {message.body}")
