@@ -334,7 +334,7 @@ class GrammarEditor(BasePersona):
         system_prompt = f"""
         You are a function-calling assistant operating inside a JupyterLab environment.
         Your job is to read the entire notebook and if you find grammar mistakes in markdown cells, 
-        doc strings, or comments, fix them using your available tools. 
+        and fix them using your available tools. Only operate on markdown cells please. 
         Please start by calling read_notebook
         """
         self.log.info(f"PROMPT: {system_prompt}")
@@ -353,12 +353,13 @@ class GrammarEditor(BasePersona):
         # then the prompt should be something like, Hello! Take a look at the current notebook for grammar mistakes, fix them where neccesary
 
 
-    def start_collaborative_session(self, ynotebook: YNotebook):
+    def start_collaborative_session(self, ynotebook: YNotebook, path: str):
         """
         Observes awareness (cursor position, etc) and reacts when a user changes their selection.
         """
 
         def on_awareness_change(event_type, data):
+            self.log.info(f"AWARENESS CHANGED!!!!!!!!!! FOR NOTEBOOK {path}")
             for clientID, state in ynotebook.awareness.states.items():
 
                 cursors = state.get("cursors", [])
@@ -367,9 +368,9 @@ class GrammarEditor(BasePersona):
 
                 current_cell = state.get("activeCellId")
 
-                last_cell = self._last_cell
+                last_cell = self.notebooks[path]["activeCell"]
                 if current_cell != last_cell:
-                    self._last_cell = current_cell
+                    self.notebooks[path]["activeCell"] = current_cell
 
                     # Cursor moved to a different YText — likely a different cell
                     self.log.info(f"📍 Cursor changed YText for client {clientID}")
@@ -379,20 +380,49 @@ class GrammarEditor(BasePersona):
                             sender=self.id,
                         )
                     )
-                    if self._startCollab:
-                        prompt = f"The user is currently editing in cell {current_cell} so, to avoid disrupting their work, DO NOT write to, or delete that cell. You can only edit in the rest of the notebook cells"
-                        
+                   
+                    prompt = f"The user is currently editing in cell {current_cell} so, to avoid disrupting their work, DO NOT write to, or delete that cell. You can only edit in the rest of the notebook cells"
+                    
 
-                        self._running_task = getattr(self, "_running_task", None)
-                        if self._running_task and not self._running_task.done():
-                            self._running_task.cancel()
+                    self._running_task = getattr(self, "_running_task", None)
+                    if self._running_task and not self._running_task.done():
+                        self._running_task.cancel()
 
-                        self._running_task = asyncio.create_task(self.run_langgraph_agent(ynotebook, prompt))
-                        # call the agent here? with the user prompt somehow? 
+                    self._running_task = asyncio.create_task(self.run_langgraph_agent(ynotebook, prompt))
+                    # call the agent here? with the user prompt somehow? 
 
         awareness = ynotebook.awareness
         awareness.observe(on_awareness_change)
         self.log.info("✅ Awareness observer registered.")
+
+
+    async def _handle_global_awareness_change(self, client_id):
+        handler = CallContext.get(CallContext.JUPYTER_HANDLER)
+        serverapp = handler.serverapp
+        collaboration = serverapp.web_app.settings["jupyter_server_ydoc"]
+        websocket_server = collaboration.ywebsocket_server
+
+        the_room_id = "JupyterLab:globalAwareness"
+        global_doc = websocket_server.rooms[the_room_id]
+        self.log.info(f"JUPYTER LAB GLOBAL: {global_doc.awareness.states}")
+        self.log.info(f"CLIENT ID: {client_id}")
+
+        active_notebook_path = self.extract_current_notebook_path(global_doc, client_id)
+        if not active_notebook_path:
+            self.log.warning("❌ No active notebook path found.")
+            return
+        
+        self.log.info(f"NBS: {self.notebooks}")
+        self.log.info(f"CURRENT NB: {active_notebook_path}")
+        if active_notebook_path not in self.notebooks: 
+            notebook = await self.get_active_notebook(client_id, active_notebook_path)
+            active_cell = await self.get_active_cell(notebook)
+            self.notebooks[active_notebook_path] = {
+                "activeCell": active_cell
+            }
+            if notebook:
+                self.start_collaborative_session(notebook, active_notebook_path)
+
 
 
     async def start_global_observation(self, client_id):
@@ -408,15 +438,8 @@ class GrammarEditor(BasePersona):
 
         doc = websocket_server.rooms[the_room_id]
 
-        async def on_awareness_change(event_type, data):
-            doc = websocket_server.rooms[the_room_id]
-            self.log.info(f"JUPYTER LAB GLOBAL: {doc.awareness.states}")
-            self.log.info(f"CLIENT ID: {client_id}")
-
-            global_doc = websocket_server.rooms[the_room_id]
-            active_notebook_path = self.extract_current_notebook_path(global_doc, client_id)
-            notebook = self.get_active_notebook(client_id, active_notebook_path)
-            self.start_collaborative_session(notebook)
+        def on_awareness_change(event_type, data):
+            asyncio.create_task(self._handle_global_awareness_change(client_id))
                 
     
         awareness = doc.awareness
@@ -456,12 +479,14 @@ class GrammarEditor(BasePersona):
         # make a simple agent with one tool
         # that tool is starting a collaborative session
 
+        await start_collaborative_session()
 
-        self.log.info(f"MESSAGE BODY: {message.body}")
-        if message.body == "@GrammarEditor Can you start a collaborative session?": 
-            self._startCollab = True
-            await self.stream_typing("Starting collaborative session now. Looking for grammar mistakes...")
-            self.start_collaborative_session(notebook)
+
+        #self.log.info(f"MESSAGE BODY: {message.body}")
+        #if message.body == "@GrammarEditor Can you start a collaborative session?": 
+        #    self._startCollab = True
+        #    await self.stream_typing("Starting collaborative session now. Looking for grammar mistakes...")
+        #    self.start_collaborative_session(notebook)
 
 
 
