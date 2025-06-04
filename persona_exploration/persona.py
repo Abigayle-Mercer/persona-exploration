@@ -16,7 +16,6 @@ from typing import Optional
 from langgraph.graph import START, END, StateGraph
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import MemorySaver
-from langchain_core.messages import ToolMessage
 from typing import Dict, Any, Tuple
 from jupyter_server_ai_tools import find_tools, run_tools
 from typing import Optional, Tuple
@@ -122,6 +121,8 @@ class GrammarEditor(BasePersona):
         self._startCollab = False
         self._user_prompt = ""
         self.notebooks = {}
+        self._collab_task_in_progress = False
+
 
     @property
     def defaults(self):
@@ -135,10 +136,11 @@ class GrammarEditor(BasePersona):
 
     async def get_active_cell(self, notebook): 
         awareness_states = notebook.awareness.states
-        self.log.info(f"ALL STATES: {awareness_states.items()}")
+        self.log.info(f"[DEBUG] get_active_cell CALLED. awareness_states = {dict(awareness_states)}")
         for client_id, state in awareness_states.items():
             active_cell = state.get("activeCellId")
             self.log.info(f"👤 Client {client_id} activeCellId: {active_cell}")
+            self.log.info(f"ACTIVE CELL IS: {active_cell}")
             if active_cell: 
                 return active_cell
 
@@ -266,29 +268,42 @@ class GrammarEditor(BasePersona):
             return {"messages": messages + [full_message]}
         def should_continue(state):
             last_message = state["messages"][-1]
-            return "continue" if "tool_calls" in last_message.additional_kwargs else "end"
+            self.log.info(f"INSIDE SHOULD OCNTINUE: LAST MESSAGE: {last_message}")
 
+            # If the assistant has more tools to call
+            if isinstance(last_message, AIMessage) and "tool_calls" in last_message.additional_kwargs:
+                self.log.info("CONTINUING ------------------------------")
+                return "continue"
+
+            # If we just handled a tool, go back to the agent
+            if isinstance(last_message, ToolMessage):
+                self.log.info("CONTINUING -------------------------------")
+                return "continue"
+
+            # Otherwise, we're done
+            self.log.info("ENDING ----------------------------------")
+            return "end"
 
         async def call_tool(state: Dict[str, Any]) -> Dict[str, Any]:
             messages = state["messages"]
             last_msg = messages[-1]
             tool_calls = last_msg.additional_kwargs.get("tool_calls", [])
 
+            if len(tool_calls) > 1:
+                self.log.warning("⚠️ Multiple tool calls detected. Only executing the first.")
+                tool_calls = [tool_calls[0]]
+
             results = []
 
             for call in tool_calls:
                 tool_name = call["function"]["name"]
 
-                # write calling tool to a new text file like tool_calls.txt instead of writng calling tool to the ychat
-            
+                # ✅ Stream "calling tool" message
+                calling_msg = f"🔧 Calling {tool_name}...\n"
+                stream_msg_id = self.ychat.add_message(NewMessage(body="", sender=self.id))
 
-                calling_msg = f"🔧 Calling {tool_name}...\n" 
-                stream_msg_id = self.ychat.add_message(NewMessage(
-                    body="",
-                    sender=self.id,
-                ))
                 for char in calling_msg:
-                    await asyncio.sleep(0.01)  # small delay to simulate streaming
+                    await asyncio.sleep(0.01)
                     self.ychat.update_message(
                         Message(
                             id=stream_msg_id,
@@ -300,22 +315,66 @@ class GrammarEditor(BasePersona):
                         append=True,
                     )
 
+                # ✅ Run the actual tool
                 result = await run_tools(
                     extension_manager,
                     [call],
-                    parse_fn=parse_openai_tool_call,  # this will work bc I have a lookup table in the run function
+                    parse_fn=parse_openai_tool_call,
                 )
-                
-                results.append((call, result[0]))
+                self.log.info(f"TOOL RESULTS: {result}")
+                tool_result = result[0]
 
+
+                # 🛠 If the result is a coroutine, await it
+                if asyncio.iscoroutine(tool_result):
+                    self.log.warning("⚠️ Tool returned a coroutine — awaiting it before serialization.")
+                    tool_result = await tool_result
+
+                tool_output = {
+                    "result": str(tool_result)
+                }
+
+                  # ✅ If it's a notebook-mutating tool, capture post-edit state
+                if tool_name in {"write_to_cell", "add_cell", "delete_cell"}:
+                    self.log.info("🔍 Capturing state after mutation")
+                    read_nb = tool_groups["read_notebook"]["callable"]
+
+                    try:
+                        notebook_contents_str = read_nb(notebook)
+                        notebook_cells = json.loads(notebook_contents_str)
+                    except Exception as e:
+                        self.log.warning(f"❌ Failed to read or parse notebook contents: {e}")
+                        notebook_cells = []
+
+                    try:
+                        active_cell_id = await self.get_active_cell(notebook)
+                    except Exception as e:
+                        self.log.warning(f"❌ Failed to get active cell ID: {e}")
+                        active_cell_id = None
+
+                    tool_output["notebook_snapshot"] = {
+                        "cells": notebook_cells,
+                        "activeCellId": active_cell_id
+                    }
+
+                self.log.info("HERE 6")
+                results.append((call, tool_output))
+                self.log.info("HERE 7")
+            # ✅ Format all results as ToolMessages
+
+
+            self.log.info("HERE 8")
             tool_messages = [
                 ToolMessage(
-                    name=call["function"]['name'],
-                    content=str(result),
-                    tool_call_id=call['id']
+                    name=call["function"]["name"],
+                    tool_call_id=call["id"],
+                    content=json.dumps(result_dict),
                 )
-                for call, result in results
+                for call, result_dict in results
             ]
+            self.log.info("HERE 9")
+
+            self.log.info(f"TOOL MESSAGES: {tool_messages}")
 
             return {"messages": state["messages"] + tool_messages}
 
@@ -329,13 +388,12 @@ class GrammarEditor(BasePersona):
 
         compiled = workflow.compile(checkpointer=memory)
 
-        nb = tool_groups["read_notebook"]["callable"](notebook)
-
         system_prompt = f"""
         You are a function-calling assistant operating inside a JupyterLab environment.
-        Your job is to read the entire notebook and if you find grammar mistakes in markdown cells, 
-        and fix them using your available tools. Only operate on markdown cells please. 
-        Please start by calling read_notebook
+        Your job is to read the entire notebook and add comments to the code cells, 
+        using your available tools. Only operate on code cells please. 
+        You may only call one tool at a time. If you want to perform multiple actions, wait for confirmation and state each one step by step.
+        Please start by calling read_notebook. 
         """
         self.log.info(f"PROMPT: {system_prompt}")
         state = {
@@ -353,6 +411,12 @@ class GrammarEditor(BasePersona):
         # then the prompt should be something like, Hello! Take a look at the current notebook for grammar mistakes, fix them where neccesary
 
 
+    async def _run_with_flag_reset(self, ynotebook, prompt):
+        try:
+            await self.run_langgraph_agent(ynotebook, prompt)
+        finally:
+            self._collab_task_in_progress = False
+
     def start_collaborative_session(self, ynotebook: YNotebook, path: str):
         """
         Observes awareness (cursor position, etc) and reacts when a user changes their selection.
@@ -360,19 +424,25 @@ class GrammarEditor(BasePersona):
 
         def on_awareness_change(event_type, data):
             self.log.info(f"AWARENESS CHANGED!!!!!!!!!! FOR NOTEBOOK {path}")
-            for clientID, state in ynotebook.awareness.states.items():
+            
+            if self._collab_task_in_progress:
+                self.log.info("🔄 Agent already running — skipping awareness change.")
+                return
 
-                cursors = state.get("cursors", [])
-                if not cursors:
-                    continue
+            for clientID, state in ynotebook.awareness.states.items():
+                self.log.info(" LOOKING FOR NOTEBOOKS")
+               
 
                 current_cell = state.get("activeCellId")
+                self.log.info(f"CURRENT CELL: {current_cell}")
+                if current_cell == None: 
+                    continue
+
+                
 
                 last_cell = self.notebooks[path]["activeCell"]
                 if current_cell != last_cell:
                     self.notebooks[path]["activeCell"] = current_cell
-
-                    # Cursor moved to a different YText — likely a different cell
                     self.log.info(f"📍 Cursor changed YText for client {clientID}")
                     self.ychat.add_message(
                         NewMessage(
@@ -380,16 +450,14 @@ class GrammarEditor(BasePersona):
                             sender=self.id,
                         )
                     )
-                   
+
                     prompt = f"The user is currently editing in cell {current_cell} so, to avoid disrupting their work, DO NOT write to, or delete that cell. You can only edit in the rest of the notebook cells"
-                    
 
-                    self._running_task = getattr(self, "_running_task", None)
-                    if self._running_task and not self._running_task.done():
-                        self._running_task.cancel()
-
-                    self._running_task = asyncio.create_task(self.run_langgraph_agent(ynotebook, prompt))
-                    # call the agent here? with the user prompt somehow? 
+                    # ✅ Don't cancel current job — just let it finish
+                    self._collab_task_in_progress = True
+                    self._running_task = asyncio.create_task(
+                        self._run_with_flag_reset(ynotebook, prompt)
+                    )
 
         awareness = ynotebook.awareness
         awareness.observe(on_awareness_change)
@@ -422,6 +490,8 @@ class GrammarEditor(BasePersona):
             }
             if notebook:
                 self.start_collaborative_session(notebook, active_notebook_path)
+            else: 
+                self.log.info(f"THERE WAS NO COLLABORATIVE NOTEBOOK OBSERVER STARTED FOR {active_notebook_path}")
 
 
 
@@ -441,7 +511,7 @@ class GrammarEditor(BasePersona):
         def on_awareness_change(event_type, data):
             asyncio.create_task(self._handle_global_awareness_change(client_id))
                 
-    
+
         awareness = doc.awareness
         awareness.observe(on_awareness_change)
         self.log.info("✅ GLOBAL Awareness observer registered.")
@@ -482,13 +552,13 @@ class GrammarEditor(BasePersona):
         await start_collaborative_session()
 
 
-        #self.log.info(f"MESSAGE BODY: {message.body}")
-        #if message.body == "@GrammarEditor Can you start a collaborative session?": 
-        #    self._startCollab = True
-        #    await self.stream_typing("Starting collaborative session now. Looking for grammar mistakes...")
-        #    self.start_collaborative_session(notebook)
+        self.log.info(f"MESSAGE BODY: {message.body}")
+        if message.body == "@GrammarEditor Can you start a collaborative session?": 
+            self._startCollab = True
+            await self.stream_typing("Starting collaborative session now. Looking for grammar mistakes...")
+            await start_collaborative_session()
 
 
-
+## teh fcntion ebewlosd is goin gto add two nmbers togere
 
                 
