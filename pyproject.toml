@@ -47,4 +47,4 @@ package-data = { "persona_exploration" = ["*.dat"] }
 
 [project.entry-points."jupyter_ai.personas"]
 # Replace with your actual persona class path
-explorer = "persona_exploration.persona:GrammarEditor"
+explorer = "persona_exploration.persona:CodeCommenter"

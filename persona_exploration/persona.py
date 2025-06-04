@@ -1,7 +1,3 @@
-
-
-
-
 import asyncio
 from jupyter_ai.personas.base_persona import BasePersona, PersonaDefaults
 from jupyterlab_chat.models import Message
@@ -22,6 +18,14 @@ from typing import Optional, Tuple
 from jupyter_ydoc.ynotebook import YNotebook
 from pycrdt import Text  # or y_py.YText depending on backend
 from collections import defaultdict
+from .agent import run_langgraph_agent as external_run_langgraph_agent
+from langchain_core.tools import tool
+from langchain.agents import create_openai_functions_agent, AgentExecutor
+
+from .agent import run_supervisor_agent
+
+
+from langchain.prompts import PromptTemplate
 
 
 
@@ -61,6 +65,13 @@ cell 3: Removed ""
 
 """
 TODO: 
+
+1. add in some customization for tone 
+2. add in simple supervisor 
+3. write end_observation method
+4. confirm multiple personas can do this at once
+
+
 - Some kind of cursor update for the persona when it's writing
 - be able to tell the active notebook when multiple notebooks are open
      the_room_id = "JupyterLab:globalAwareness" 
@@ -89,11 +100,6 @@ DEMO:
 
 
 
-
-
-class State(TypedDict):
-    messages: list
-
 def convert_mcp_to_openai(tools: list[dict]) -> list[dict]:
     """Convert a list of MCP-style tools to OpenAI-compatible function specs."""
     openai_tools = []
@@ -112,8 +118,12 @@ def convert_mcp_to_openai(tools: list[dict]) -> list[dict]:
     return openai_tools
 
 
+class State(TypedDict):
+    messages: list
 
-class GrammarEditor(BasePersona):
+
+
+class CodeCommenter(BasePersona):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -122,13 +132,15 @@ class GrammarEditor(BasePersona):
         self._user_prompt = ""
         self.notebooks = {}
         self._collab_task_in_progress = False
+        self.global_awareness_observer = None
+        self.notebook_observers = {}
 
 
     @property
     def defaults(self):
         return PersonaDefaults(
-            name="GrammarEditor",
-            description="A Jupyter AI Assistant who can write to notebooks to fix grammar mistakes",
+            name="CodeCommenter",
+            description="A Jupyter AI Assistant who can write to notebooks to add comments",
             avatar_path="/api/ai/static/jupyternaut.svg",
             system_prompt="You are a function-calling assistant operating inside a JupyterLab environment, use your tools to operate on the notebook!"
         )
@@ -185,8 +197,7 @@ class GrammarEditor(BasePersona):
         self.log.warning(f"❌ No active notebook found for client_id: {client_id}")
         return None
 
-
-    async def run_langgraph_agent(self, notebook: YNotebook, user_prompt: str):
+    async def run_langgraph_agent(self, notebook: YNotebook, user_prompt: str, tone_prompt):
         handler = CallContext.get(CallContext.JUPYTER_HANDLER)
         serverapp = handler.serverapp
         handler = CallContext.get(CallContext.JUPYTER_HANDLER)
@@ -208,7 +219,7 @@ class GrammarEditor(BasePersona):
         def parse_openai_tool_call(call: Dict) -> Tuple[str, Dict]:
             """
             Parses an OpenAI-style function call object and injects live objects like
-            `ynotebook` or `scheduler` into the tool arguments based on the tool name.
+            ynotebook or scheduler into the tool arguments based on the tool name.
 
             Returns:
                 A tuple of (tool_name, arguments_dict)
@@ -334,7 +345,7 @@ class GrammarEditor(BasePersona):
                     "result": str(tool_result)
                 }
 
-                  # ✅ If it's a notebook-mutating tool, capture post-edit state
+                # ✅ If it's a notebook-mutating tool, capture post-edit state
                 if tool_name in {"write_to_cell", "add_cell", "delete_cell"}:
                     self.log.info("🔍 Capturing state after mutation")
                     read_nb = tool_groups["read_notebook"]["callable"]
@@ -394,6 +405,10 @@ class GrammarEditor(BasePersona):
         using your available tools. Only operate on code cells please. 
         You may only call one tool at a time. If you want to perform multiple actions, wait for confirmation and state each one step by step.
         Please start by calling read_notebook. 
+        Please adapt the comments to the following tone: {tone_prompt}
+        You may only call one tool at a time. If you want to perform multiple actions, wait for confirmation and state each one step by step.
+        Please focus on tool calls and not sending messages to the user. 
+        Please start by calling read_notebook.
         """
         self.log.info(f"PROMPT: {system_prompt}")
         state = {
@@ -407,17 +422,17 @@ class GrammarEditor(BasePersona):
         await compiled.ainvoke(state, config=config)
 
 
-        # here I want you to get the current contents of the notebook, so call tool_groups.get_notebook() or something, 
-        # then the prompt should be something like, Hello! Take a look at the current notebook for grammar mistakes, fix them where neccesary
+    # here I want you to get the current contents of the notebook, so call tool_groups.get_notebook() or something, 
+    # then the prompt should be something like, Hello! Take a look at the current notebook for grammar mistakes, fix them where neccesary
 
 
-    async def _run_with_flag_reset(self, ynotebook, prompt):
+    async def _run_with_flag_reset(self, ynotebook, prompt, tone_prompt):
         try:
-            await self.run_langgraph_agent(ynotebook, prompt)
+            await self.run_langgraph_agent(ynotebook, prompt, tone_prompt)
         finally:
             self._collab_task_in_progress = False
 
-    def start_collaborative_session(self, ynotebook: YNotebook, path: str):
+    def start_collaborative_session(self, ynotebook: YNotebook, path: str, tone_prompt):
         """
         Observes awareness (cursor position, etc) and reacts when a user changes their selection.
         """
@@ -456,15 +471,16 @@ class GrammarEditor(BasePersona):
                     # ✅ Don't cancel current job — just let it finish
                     self._collab_task_in_progress = True
                     self._running_task = asyncio.create_task(
-                        self._run_with_flag_reset(ynotebook, prompt)
+                        self._run_with_flag_reset(ynotebook, prompt, tone_prompt)
                     )
 
         awareness = ynotebook.awareness
-        awareness.observe(on_awareness_change)
-        self.log.info("✅ Awareness observer registered.")
+        unsubscribe = awareness.observe(on_awareness_change)
+        self.notebook_observers[path] = (awareness, unsubscribe)
+        self.log.info(f"✅ Awareness observer registered for notebook: {path}")
 
 
-    async def _handle_global_awareness_change(self, client_id):
+    async def _handle_global_awareness_change(self, client_id, tone_prompt):
         handler = CallContext.get(CallContext.JUPYTER_HANDLER)
         serverapp = handler.serverapp
         collaboration = serverapp.web_app.settings["jupyter_server_ydoc"]
@@ -473,7 +489,6 @@ class GrammarEditor(BasePersona):
         the_room_id = "JupyterLab:globalAwareness"
         global_doc = websocket_server.rooms[the_room_id]
         self.log.info(f"JUPYTER LAB GLOBAL: {global_doc.awareness.states}")
-        self.log.info(f"CLIENT ID: {client_id}")
 
         active_notebook_path = self.extract_current_notebook_path(global_doc, client_id)
         if not active_notebook_path:
@@ -489,16 +504,17 @@ class GrammarEditor(BasePersona):
                 "activeCell": active_cell
             }
             if notebook:
-                self.start_collaborative_session(notebook, active_notebook_path)
+                self.start_collaborative_session(notebook, active_notebook_path, tone_prompt)
             else: 
                 self.log.info(f"THERE WAS NO COLLABORATIVE NOTEBOOK OBSERVER STARTED FOR {active_notebook_path}")
 
 
 
-    async def start_global_observation(self, client_id):
+    async def start_global_observation(self, client_id, tone_prompt):
         """
         Observes awareness changes in global awarness
         """
+        self.log.info("INSIDE STARTING GLOBAL OBS")
         handler = CallContext.get(CallContext.JUPYTER_HANDLER)
         serverapp = handler.serverapp
         collaboration = serverapp.web_app.settings["jupyter_server_ydoc"]
@@ -509,54 +525,85 @@ class GrammarEditor(BasePersona):
         doc = websocket_server.rooms[the_room_id]
 
         def on_awareness_change(event_type, data):
-            asyncio.create_task(self._handle_global_awareness_change(client_id))
+            asyncio.create_task(self._handle_global_awareness_change(client_id, tone_prompt))
                 
 
         awareness = doc.awareness
-        awareness.observe(on_awareness_change)
+        unsubscribe = awareness.observe(on_awareness_change)
+        self.global_awareness_observer = (awareness, unsubscribe)
         self.log.info("✅ GLOBAL Awareness observer registered.")
 
 
 
-    async def stream_typing(self, full_text: str):
-        stream_msg_id = self.ychat.add_message(NewMessage(body="", sender=self.id))
-        current_text = ""
-
-        for char in full_text:
-            await asyncio.sleep(0.02)  # simulate typing speed
-            current_text += char
-            self.ychat.update_message(
-                Message(
-                    id=stream_msg_id,
-                    body=current_text,
-                    time=time(),
-                    sender=self.id,
-                    raw_time=False,
-                ),
-                append=False,  # we're replacing, not appending individual lines
-            )
-
-
 
     async def process_message(self, message: Message):
-
         client_id = message.sender
 
+        @tool
+        async def start_collaborative_session(tone_prompt: Optional[str] = "") -> str:
+            """Starts a comment adding collaborative session. Optionally accepts a tone prompt."""
+            await self.start_global_observation(client_id, tone_prompt)
+            return f"Collaborative session started with tone: '{tone_prompt}'"
 
-        async def start_collaborative_session(): 
-            await self.start_global_observation(client_id)
+        @tool
+        async def stop_collaborative_session() -> str:
+            """Stops the current collaborative comment adding session."""
 
-        # make a simple agent with one tool
-        # that tool is starting a collaborative session
+            # Unregister global awareness observer
+            if self.global_awareness_observer:
+                awareness, unsubscribe = self.global_awareness_observer
+                awareness.unobserve(unsubscribe)
+                self.global_awareness_observer = None
+                self.log.info("🛑 Global awareness observer removed.")
 
-        await start_collaborative_session()
+            # Unregister all notebook-level observers
+            for path, (awareness, unsubscribe) in self.notebook_observers.items():
+                awareness.unobserve(unsubscribe)
+                self.log.info(f"🛑 Notebook awareness observer removed for: {path}")
+            self.notebook_observers.clear()
 
+            # reset per-notebook state
+            self.notebooks.clear()
 
-        self.log.info(f"MESSAGE BODY: {message.body}")
-        if message.body == "@GrammarEditor Can you start a collaborative session?": 
-            self._startCollab = True
-            await self.stream_typing("Starting collaborative session now. Looking for grammar mistakes...")
-            await start_collaborative_session()
+            return "Collaborative session stopped and all observers removed."
+
+        async def stream_typing(full_text: str) -> str:
+            """Streams a chat message to the user as if it's being typed."""
+            stream_msg_id = self.ychat.add_message(NewMessage(body="", sender=self.id))
+            current_text = ""
+
+            for char in full_text:
+                await asyncio.sleep(0.02)
+                current_text += char
+                self.ychat.update_message(
+                    Message(
+                        id=stream_msg_id,
+                        body=current_text,
+                        time=time(),
+                        sender=self.id,
+                        raw_time=False,
+                    ),
+                    append=False,
+                )
+            return "Typing stream completed."
+
+        tools = [start_collaborative_session, stop_collaborative_session]
+        await run_supervisor_agent(
+            logger=self.log,
+            stream=stream_typing,
+            user_message=message.body,
+            tools=tools
+        )
+        
+
+        
+
+        # Optionally stream response to chat
+        #self.ychat.add_message(NewMessage(body=response, sender=self.id))
+
+        #await start_collaborative_session(tone_prompt="Sound like a sassy russian")
+
+        # make a simple agent with two tools
 
 
 ## teh fcntion ebewlosd is goin gto add two nmbers togere
